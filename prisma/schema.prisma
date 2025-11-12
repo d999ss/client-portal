@@ -1,0 +1,507 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// TENANTS & USERS
+// ============================================
+
+model Tenant {
+  id                String   @id @default(cuid())
+  name              String
+  slug              String   @unique
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Stripe
+  stripeCustomerId       String?  @unique
+  stripeSubscriptionId   String?  @unique
+  subscriptionStatus     String?  // active, canceled, past_due, etc
+  subscriptionTier       String?  // starter, pro, enterprise
+  subscriptionEndsAt     DateTime?
+
+  // Storage & Limits
+  storageUsedBytes  BigInt   @default(0)
+  storageQuotaBytes BigInt   @default(5368709120) // 5GB default
+
+  // Relations
+  users             User[]
+  projects          Project[]
+  documents         Document[]
+  folders           Folder[]
+  messages          Message[]
+  tickets           Ticket[]
+  notifications     Notification[]
+  invoices          Invoice[]
+  activities        Activity[]
+
+  @@index([stripeCustomerId])
+  @@index([slug])
+}
+
+enum UserRole {
+  CLIENT_ADMIN
+  CLIENT_USER
+  TEAM_ADMIN
+  TEAM_MEMBER
+  SUPER_ADMIN
+}
+
+model User {
+  id              String   @id @default(cuid())
+  clerkId         String   @unique
+  email           String   @unique
+  firstName       String?
+  lastName        String?
+  avatarUrl       String?
+  role            UserRole @default(CLIENT_USER)
+
+  // Tenant relationship
+  tenantId        String?
+  tenant          Tenant?  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  // Profile
+  phone           String?
+  timezone        String?
+  workingHours    String?
+  bio             String?
+  title           String?
+  expertise       String[] // ["Frontend", "Design", "DevOps"]
+
+  // Status
+  isActive        Boolean  @default(true)
+  lastSeenAt      DateTime @default(now())
+  onlineStatus    String   @default("offline") // online, busy, away, offline
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  sentMessages         Message[]       @relation("MessageSender")
+  receivedMessages     Message[]       @relation("MessageRecipient")
+  createdTickets       Ticket[]        @relation("TicketCreator")
+  assignedTickets      Ticket[]        @relation("TicketAssignee")
+  ticketResponses      TicketResponse[]
+  notifications        Notification[]
+  uploadedDocuments    Document[]      @relation("DocumentUploader")
+  documentComments     DocumentComment[]
+  projectAssignments   ProjectMember[]
+  activities           Activity[]
+
+  @@index([clerkId])
+  @@index([tenantId])
+  @@index([email])
+}
+
+// ============================================
+// PROJECTS
+// ============================================
+
+enum ProjectStatus {
+  DISCOVERY
+  IN_PROGRESS
+  QA
+  DEPLOYED
+  COMPLETE
+  ON_HOLD
+}
+
+model Project {
+  id              String        @id @default(cuid())
+  name            String
+  description     String?
+  status          ProjectStatus @default(IN_PROGRESS)
+
+  // Dates
+  startDate       DateTime?
+  endDate         DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  // Budget
+  budgetAmount    Decimal?      @db.Decimal(10, 2)
+  budgetSpent     Decimal       @default(0) @db.Decimal(10, 2)
+  budgetCurrency  String        @default("USD")
+
+  // Progress
+  progressPercent Int           @default(0)
+
+  // Tenant
+  tenantId        String
+  tenant          Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  // Relations
+  members         ProjectMember[]
+  milestones      Milestone[]
+  documents       Document[]
+  messages        Message[]
+  activities      Activity[]
+
+  @@index([tenantId])
+  @@index([status])
+}
+
+model ProjectMember {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role        String?  // "Lead Developer", "Designer", etc
+  addedAt     DateTime @default(now())
+
+  @@unique([projectId, userId])
+  @@index([projectId])
+  @@index([userId])
+}
+
+model Milestone {
+  id          String    @id @default(cuid())
+  projectId   String
+  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  title       String
+  description String?
+  dueDate     DateTime?
+  completedAt DateTime?
+  isCompleted Boolean   @default(false)
+  order       Int       @default(0)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([projectId])
+}
+
+// ============================================
+// DOCUMENTS & FILES
+// ============================================
+
+model Folder {
+  id          String     @id @default(cuid())
+  name        String
+  parentId    String?
+  parent      Folder?    @relation("FolderHierarchy", fields: [parentId], references: [id], onDelete: Cascade)
+  children    Folder[]   @relation("FolderHierarchy")
+
+  tenantId    String
+  tenant      Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  documents   Document[]
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  @@index([tenantId])
+  @@index([parentId])
+}
+
+model Document {
+  id              String    @id @default(cuid())
+  name            String
+  fileName        String
+  fileSize        BigInt
+  fileType        String
+
+  // Storage
+  storageKey      String    // S3/Vercel Blob key
+  storageUrl      String
+
+  // Versioning
+  version         Int       @default(1)
+  previousVersionId String?
+  previousVersion   Document? @relation("DocumentVersions", fields: [previousVersionId], references: [id])
+  nextVersions      Document[] @relation("DocumentVersions")
+
+  // Organization
+  folderId        String?
+  folder          Folder?   @relation(fields: [folderId], references: [id], onDelete: SetNull)
+  projectId       String?
+  project         Project?  @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  // Tenant & Uploader
+  tenantId        String
+  tenant          Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  uploadedById    String
+  uploadedBy      User      @relation("DocumentUploader", fields: [uploadedById], references: [id])
+
+  // Metadata
+  description     String?
+  tags            String[]
+  isPublic        Boolean   @default(false)
+
+  // Audit
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime? // Soft delete
+
+  // Relations
+  comments        DocumentComment[]
+  shares          DocumentShare[]
+  accessLogs      DocumentAccessLog[]
+
+  @@index([tenantId])
+  @@index([folderId])
+  @@index([projectId])
+  @@index([uploadedById])
+}
+
+model DocumentComment {
+  id          String   @id @default(cuid())
+  documentId  String
+  document    Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  content     String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([documentId])
+  @@index([userId])
+}
+
+model DocumentShare {
+  id          String    @id @default(cuid())
+  documentId  String
+  document    Document  @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  shareToken  String    @unique
+  expiresAt   DateTime?
+  password    String?
+  accessCount Int       @default(0)
+  createdAt   DateTime  @default(now())
+
+  @@index([documentId])
+  @@index([shareToken])
+}
+
+model DocumentAccessLog {
+  id          String   @id @default(cuid())
+  documentId  String
+  document    Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  userId      String?
+  action      String   // "viewed", "downloaded", "deleted"
+  ipAddress   String?
+  userAgent   String?
+  accessedAt  DateTime @default(now())
+
+  @@index([documentId])
+  @@index([userId])
+}
+
+// ============================================
+// MESSAGING & SUPPORT
+// ============================================
+
+model Message {
+  id            String   @id @default(cuid())
+  content       String
+
+  senderId      String
+  sender        User     @relation("MessageSender", fields: [senderId], references: [id])
+  recipientId   String?
+  recipient     User?    @relation("MessageRecipient", fields: [recipientId], references: [id])
+
+  projectId     String?
+  project       Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  tenantId      String
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  isRead        Boolean  @default(false)
+  readAt        DateTime?
+
+  // Attachments (stored as JSON array of file refs)
+  attachments   Json?
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([senderId])
+  @@index([recipientId])
+  @@index([projectId])
+  @@index([tenantId])
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  CLOSED
+}
+
+enum TicketPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum TicketCategory {
+  BUG
+  FEATURE_REQUEST
+  QUESTION
+  BILLING
+  OTHER
+}
+
+model Ticket {
+  id          String         @id @default(cuid())
+  title       String
+  description String
+  status      TicketStatus   @default(OPEN)
+  priority    TicketPriority @default(MEDIUM)
+  category    TicketCategory @default(QUESTION)
+
+  createdById String
+  createdBy   User           @relation("TicketCreator", fields: [createdById], references: [id])
+
+  assignedToId String?
+  assignedTo   User?         @relation("TicketAssignee", fields: [assignedToId], references: [id])
+
+  tenantId    String
+  tenant      Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  // Timestamps
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  resolvedAt  DateTime?
+
+  // Relations
+  responses   TicketResponse[]
+
+  @@index([tenantId])
+  @@index([createdById])
+  @@index([assignedToId])
+  @@index([status])
+}
+
+model TicketResponse {
+  id          String   @id @default(cuid())
+  ticketId    String
+  ticket      Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  content     String
+  isInternal  Boolean  @default(false) // Internal notes not visible to client
+  attachments Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([ticketId])
+  @@index([userId])
+}
+
+// ============================================
+// NOTIFICATIONS
+// ============================================
+
+enum NotificationType {
+  DOCUMENT_UPLOADED
+  DOCUMENT_SIGNED
+  MESSAGE_RECEIVED
+  TICKET_RESPONSE
+  INVOICE_ISSUED
+  INVOICE_DUE
+  PAYMENT_SUCCESS
+  PAYMENT_FAILED
+  SUBSCRIPTION_RENEWED
+  MILESTONE_COMPLETED
+  MENTION
+}
+
+model Notification {
+  id          String           @id @default(cuid())
+  userId      String
+  user        User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tenantId    String
+  tenant      Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  type        NotificationType
+  title       String
+  message     String
+  link        String?
+
+  isRead      Boolean          @default(false)
+  readAt      DateTime?
+
+  // Metadata (JSON for flexibility)
+  metadata    Json?
+
+  createdAt   DateTime         @default(now())
+
+  @@index([userId])
+  @@index([tenantId])
+  @@index([isRead])
+}
+
+// ============================================
+// INVOICES & BILLING
+// ============================================
+
+model Invoice {
+  id              String   @id @default(cuid())
+  tenantId        String
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  // Stripe
+  stripeInvoiceId String   @unique
+
+  // Details
+  invoiceNumber   String?
+  amountDue       Decimal  @db.Decimal(10, 2)
+  amountPaid      Decimal  @default(0) @db.Decimal(10, 2)
+  currency        String   @default("USD")
+  status          String   // draft, open, paid, void, uncollectible
+
+  // Dates
+  invoiceDate     DateTime
+  dueDate         DateTime?
+  paidAt          DateTime?
+
+  // URLs
+  hostedInvoiceUrl String?
+  invoicePdfUrl    String?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([tenantId])
+  @@index([stripeInvoiceId])
+}
+
+// ============================================
+// ACTIVITY LOG
+// ============================================
+
+model Activity {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  action      String   // "uploaded_document", "created_project", "sent_message", etc
+  entityType  String?  // "document", "project", "ticket", etc
+  entityId    String?
+
+  description String
+  metadata    Json?
+
+  // Audit
+  ipAddress   String?
+  userAgent   String?
+
+  createdAt   DateTime @default(now())
+
+  @@index([tenantId])
+  @@index([userId])
+  @@index([createdAt])
+}
